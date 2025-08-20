@@ -1,0 +1,10 @@
+streamlit
+langchain
+langchain-google-genai
+chromadb
+python-dotenv
+unstructured
+markdown
+python-magic
+nltk
+nest-asyncio
