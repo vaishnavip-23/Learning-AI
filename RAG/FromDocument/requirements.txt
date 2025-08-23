@@ -8,3 +8,8 @@ markdown
 python-magic
 nltk
 nest-asyncio
+langchain-community
+langchain-huggingface
+FlagEmbedding
+sentence-transformers
+huggingface_hub
