@@ -1,16 +1,14 @@
 import streamlit as st
 import os
 from dotenv import load_dotenv
-from langchain.document_loaders import UnstructuredMarkdownLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain.vectorstores import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
-import asyncio
-import nest_asyncio
-
-# Apply nest_asyncio to handle async operations in Streamlit
-nest_asyncio.apply()
+from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+try:
+    from FlagEmbedding import FlagReranker
+except Exception:
+    FlagReranker = None
 
 # Setup page config
 st.set_page_config(
@@ -39,11 +37,8 @@ if not env_loaded:
     st.error("Could not find .env file in any of the expected locations. Please ensure it exists and contains GEMINI_API_KEY.")
 
 # Constants
-DATA_PATH = os.path.join(os.path.dirname(__file__), "alice_in_wonderland.md")
-PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
-COLLECTION = "docs"
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_store")
+COLLECTION = "alice"
 
 def check_api_key():
     """Check if API key is properly set"""
@@ -55,186 +50,207 @@ def check_api_key():
     os.environ["GOOGLE_API_KEY"] = api_key
     return True
 
-def is_meaningful_chunk(text: str) -> bool:
-    """Filter out boilerplate content"""
-    skip_patterns = [
-        "Project Gutenberg",
-        "THE MILLENNIUM FULCRUM EDITION",
-        "Contents",
-        "*      *      *",
-        "trademark",
-        "license",
-        "copyright"
-    ]
-    return not any(pattern.lower() in text.lower() for pattern in skip_patterns)
-
 @st.cache_resource
-def initialize_rag():
-    """Initialize the RAG system"""
+def load_vectordb():
+    """Load the persisted Chroma DB built in the notebook using BGE embeddings."""
     try:
-        # Load and preprocess document
-        loader = UnstructuredMarkdownLoader(DATA_PATH, show_progress=True)
-        docs = loader.load()
-        
-        # Configure text splitter
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
-            keep_separator=True,
-            strip_whitespace=True,
-            add_start_index=True,
-        )
-        
-        # Split and filter chunks
-        chunks = splitter.split_documents(docs)
-        filtered_chunks = [
-            chunk for chunk in chunks 
-            if is_meaningful_chunk(chunk.page_content) and len(chunk.page_content.strip()) > 50
-        ]
-        
-        # Initialize embeddings
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            task_type="retrieval_query"
-        )
-        
-        # Create vector store
-        vectordb = Chroma.from_documents(
-            documents=filtered_chunks,
-            embedding=embeddings,
+        sqlite_path = os.path.join(PERSIST_DIR, "chroma.sqlite3")
+        if not os.path.isdir(PERSIST_DIR) or not os.path.exists(sqlite_path):
+            st.error("Chroma store not found. Run the notebook to build 'chroma_store/'.")
+            return None
+        embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+        vectordb = Chroma(
+            embedding_function=embeddings,
             persist_directory=PERSIST_DIR,
-            collection_name=COLLECTION
+            collection_name=COLLECTION,
         )
-        
-        return vectordb, embeddings
+        return vectordb
     except Exception as e:
-        st.error(f"Error initializing RAG system: {str(e)}")
-        return None, None
+        st.error(f"Error loading Chroma DB: {str(e)}")
+        return None
 
-def get_answer(vectordb, query: str, k: int = 3):
-    """Get answer for the query"""
+def expand_queries(llm: ChatGoogleGenerativeAI, question: str, n: int = 4):
+    prompt = f"""
+    Generate {n} different phrasings of the following user question:
+    "{question}"
+    Provide only the variations, one per line.
+    """
+    out = llm.invoke(prompt)
+    expansions = list(set(out.content.strip().split("\n")))
+    return [q.strip("- ").strip() for q in expansions if q.strip()]
+
+def retrieve_candidates(vectordb: Chroma, queries, per_query_k: int = 5):
+    results = []
+    seen = set()
+    for q in queries:
+        hits = vectordb.similarity_search_with_score(q, k=per_query_k)
+        for doc, score in hits:
+            key = (doc.metadata.get('start_index'), doc.metadata.get('chunk_number'))
+            if key not in seen:
+                seen.add(key)
+                results.append((doc, score, q))
+    return results
+
+def rerank_candidates(question: str, candidates, top_n: int = 5):
+    if FlagReranker is None:
+        # Fallback: use ANN scores (ascending cosine distance)
+        sorted_candidates = sorted(candidates, key=lambda x: x[1])
+        return [(doc, score) for (doc, score, _q) in sorted_candidates[:top_n]]
+    reranker = FlagReranker("BAAI/bge-reranker-base", use_fp16=True)
+    pairs = [[question, doc.page_content] for doc, _, _ in candidates]
+    scores = reranker.compute_score(pairs)
+    reranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+    seen = set()
+    top_docs = []
+    for (doc, _score, _q), rerank_score in reranked:
+        start_index = doc.metadata.get('start_index')
+        if start_index not in seen:
+            seen.add(start_index)
+            top_docs.append((doc, rerank_score))
+        if len(top_docs) == top_n:
+            break
+    return top_docs
+
+def build_context(doc_with_scores):
+    parts = []
+    for d, _ in doc_with_scores:
+        m = getattr(d, 'metadata', {}) or {}
+        chapter_number = m.get('chapter_number', 'Unknown')
+        chapter_title = m.get('chapter_title', 'Unknown')
+        start_index = m.get('start_index', '?')
+        chunk_number = m.get('chunk_number', '?')
+        header = f"[Chapter {chapter_number} {chapter_title} | Position={start_index} | Chunk {chunk_number}]"
+        parts.append(header + "\n" + d.page_content)
+    return "\n\n".join(parts)
+
+def get_answer(
+    vectordb: Chroma,
+    query: str,
+    use_reranker: bool = True,
+    per_query_k: int = 5,
+    final_top_n: int = 5,
+):
     try:
-        # Use MMR retrieval
-        retriever = vectordb.as_retriever(
-            search_type="mmr",
-            search_kwargs={
-                "k": k * 2,
-                "fetch_k": k * 4,
-                "lambda_mult": 0.7
-            }
+        llm_gemini = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0.3,
         )
-        
-        # Get and filter documents
-        docs = retriever.get_relevant_documents(query)
-        seen_content = set()
-        filtered_docs = []
-        
-        for doc in docs:
-            start_index = doc.metadata.get('start_index', None)
-            if start_index is None:
-                continue
-            content = ' '.join(doc.page_content.split())
-            if content in seen_content:
-                continue
-            seen_content.add(content)
-            filtered_docs.append((doc, start_index))
-        
-        # Sort and take top 3
-        filtered_docs.sort(key=lambda x: x[1])
-        final_docs = [doc for doc, _ in filtered_docs[:3]]
-        
-        if not final_docs:
-            return "No relevant information found."
-        
-        # Prepare context
-        contexts = []
-        for doc in final_docs:
-            start_idx = doc.metadata.get('start_index', 0)
-            context = f"[Story position {start_idx}]:\n{doc.page_content}"
-            contexts.append(context)
-        formatted_context = "\n\n---\n\n".join(contexts)
-        
-        # Create prompt
-        template = """You are helping answer questions about Alice in Wonderland. Use only the provided context to answer.
-If you can't find the answer in the context, say "Based on the provided context, I cannot answer this question."
+        expansions = expand_queries(llm_gemini, query, n=4)
+        queries = [query] + expansions
 
-Context (in story order):
-{context}
+        candidates = retrieve_candidates(vectordb, queries, per_query_k=per_query_k)
+        if use_reranker and candidates:
+            top_docs = rerank_candidates(query, candidates, top_n=min(final_top_n, len(candidates)))
+        else:
+            sorted_candidates = sorted(candidates, key=lambda x: x[1])
+            top_docs = [(doc, score) for (doc, score, _q) in sorted_candidates[:final_top_n]]
+
+        if not top_docs:
+            return "No relevant information found.", []
+
+        context = build_context(top_docs)
+        prompt = PromptTemplate.from_template(
+            """
+You are a helpful assistant. 
+Answer the user question using ONLY the provided context.
+Read the chunk summary carefully and if it matches with the question then check the chunk content and answer the question.
+Expand the answer into at least 2–3 sentences and don't use quotes from the content unless the question is asking for the quotes.
 
 Question: {question}
+Context:
+{context}
+"""
+        )
 
-Instructions:
-1. Use only information from the context
-2. Be specific and quote relevant parts
-3. Follow the story's sequence when describing events
-4. If information is incomplete, say so
-
-Answer:"""
-        
-        prompt = PromptTemplate(input_variables=["context", "question"], template=template)
-        formatted = prompt.format(context=formatted_context, question=query)
-        
-        # Get response from Gemini
         chat = ChatGoogleGenerativeAI(
-            model="models/gemini-1.5-flash",
+            model="gemini-2.5-flash",
             temperature=0.2,
             top_p=0.85,
             top_k=30,
             max_output_tokens=512
         )
-        response = chat.invoke(formatted)
-        
-        return response.content
+        response = chat.invoke(prompt.format(question=query, context=context))
+        return response.content, top_docs
     except Exception as e:
-        return f"Error generating answer: {str(e)}"
+        return f"Error generating answer: {str(e)}", []
 
 def main():
     st.title("🎩 Alice in Wonderland Q&A")
-    st.write("Ask questions about Alice in Wonderland and get answers based on the original text!")
-    
+    st.markdown(
+        "Discover answers grounded in the original text of Alice in Wonderland.\n\n"
+        "Ask a question in the box below. The app searches a persistent knowledge base built from the book,"
+        " expands your query, reranks the most relevant passages, and answers using only the retrieved context."
+    )
+
     # Check API key first
     if not check_api_key():
         return
-    
-    # Initialize RAG system
-    with st.spinner("Initializing the system..."):
-        vectordb, embeddings = initialize_rag()
+
+    # Load persisted vector DB
+    with st.spinner("Loading knowledge base (Chroma)..."):
+        vectordb = load_vectordb()
         if vectordb is None:
             return
-    
-    # Create two columns
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        # Query input
-        query = st.text_input("Ask your question:", placeholder="e.g., What happens at the tea party?")
-        
-        if query:
-            with st.spinner("Searching for answer..."):
-                answer = get_answer(vectordb, query)
-                
-                # Display answer in a nice format
-                st.write("### Answer")
-                st.write(answer)
-    
-    with col2:
-        # Example questions
-        st.write("### Try these examples:")
+
+    # Sidebar: instructions and examples
+    with st.sidebar:
+        st.header("How to use")
+        st.markdown(
+            "- **Type a question** about the story.\n"
+            "- **Or click a sample question** to try.\n"
+            "- Toggle **Rerank with cross-encoder** for higher relevance.\n"
+            "- Optionally **show sources** to see which chunks were used."
+        )
+
+        st.subheader("Settings")
+        use_reranker = st.checkbox("Rerank with BGE cross-encoder", value=True)
+        final_top_n = st.slider("Max supporting chunks", 3, 8, 5)
+        show_sources = st.checkbox("Show retrieved sources", value=True)
+
+        st.subheader("Try a sample")
         examples = [
+            "Why did Alice follow the White Rabbit and what happened immediately after?",
             "What happens at the tea party?",
             "How does Alice meet the Mad Hatter?",
             "What does the Queen of Hearts say?",
-            "Describe the Cheshire Cat's appearance"
+            "Describe the Cheshire Cat's appearance",
         ]
-        for example in examples:
-            if st.button(example):
-                with st.spinner("Searching for answer..."):
-                    answer = get_answer(vectordb, example)
-                    # Switch to col1 to display answer
-                    with col1:
-                        st.write("### Answer")
-                        st.write(answer)
+        if "user_query" not in st.session_state:
+            st.session_state.user_query = ""
+        for ex in examples:
+            if st.button(ex):
+                st.session_state.user_query = ex
+                st.experimental_rerun()
+
+    # Main interaction
+    query = st.text_input(
+        "Ask your question",
+        key="user_query",
+        placeholder="e.g., Why did Alice follow the White Rabbit?",
+    )
+
+    if query:
+        with st.spinner("Thinking..."):
+            answer, sources = get_answer(
+                vectordb,
+                query,
+                use_reranker=use_reranker,
+                final_top_n=final_top_n,
+            )
+        st.markdown("### Answer")
+        st.write(answer)
+
+        if show_sources and sources:
+            with st.expander("View retrieved sources"):
+                for d, score in sources:
+                    m = d.metadata or {}
+                    chapter_number = m.get('chapter_number', 'Unknown')
+                    chapter_title = m.get('chapter_title', 'Unknown')
+                    start_idx = m.get('start_index', '?')
+                    chunk_no = m.get('chunk_number', '?')
+                    st.markdown(
+                        f"- **Chapter**: {chapter_number} {chapter_title} | **Pos**: {start_idx} | **Chunk**: {chunk_no} | **Score**: {score}"
+                    )
 
 if __name__ == "__main__":
     main()
