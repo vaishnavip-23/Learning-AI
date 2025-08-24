@@ -152,7 +152,7 @@ def get_answer(
     query: str,
     use_reranker: bool = True,
     per_query_k: int = 5,
-    final_top_n: int = 5,
+    final_top_n: int = 8,  # Fixed at 8 chunks
 ):
     try:
         llm_gemini = ChatGoogleGenerativeAI(
@@ -222,13 +222,10 @@ def main():
         st.markdown(
             "- **Type a question** about the story.\n"
             "- **Or click a sample question** to try.\n"
-            "- Toggle **Rerank with cross-encoder** for higher relevance.\n"
             "- Optionally **show sources** to see which chunks were used."
         )
 
         st.subheader("Settings")
-        use_reranker = st.checkbox("Rerank with BGE cross-encoder", value=True)
-        final_top_n = st.slider("Max supporting chunks", 3, 8, 5)
         show_sources = st.checkbox("Show retrieved sources", value=True)
 
         st.subheader("Try a sample")
@@ -257,8 +254,8 @@ def main():
             answer, sources = get_answer(
                 vectordb,
                 query,
-                use_reranker=use_reranker,
-                final_top_n=final_top_n,
+                use_reranker=True,  # Always use reranker
+                final_top_n=8,  # Fixed at 8 chunks
             )
         st.markdown("### Question")
         st.write(query)
