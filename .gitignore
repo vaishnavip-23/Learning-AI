@@ -37,4 +37,5 @@ venv/
 ENV/
 
 # Keep devcontainer config
-!.devcontainer/
+.devcontainer/
+!.devcontainer/devcontainer.json
