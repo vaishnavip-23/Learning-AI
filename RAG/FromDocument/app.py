@@ -30,22 +30,20 @@ st.set_page_config(
     layout="wide"
 )
 
-"""
-Local .env loading (disabled by default for Streamlit Cloud).
-Uncomment this block for local development to auto-load a .env file.
-
-possible_env_paths = [
-    os.path.join(os.path.dirname(__file__), '.env'),
-    os.path.expanduser('~/.env'),
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'),
-    '.env'
-]
-for env_path in possible_env_paths:
-    if os.path.exists(env_path):
-        load_dotenv(env_path)
-        st.info(f"Loaded .env from: {env_path}")
-        break
-"""
+# Local .env loading (disabled by default for Streamlit Cloud).
+# Uncomment this block for local development to auto-load a .env file.
+#
+# possible_env_paths = [
+#     os.path.join(os.path.dirname(__file__), '.env'),
+#     os.path.expanduser('~/.env'),
+#     os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'),
+#     '.env'
+# ]
+# for env_path in possible_env_paths:
+#     if os.path.exists(env_path):
+#         load_dotenv(env_path)
+#         st.info(f"Loaded .env from: {env_path}")
+#         break
 
 # Constants
 PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_store")
@@ -245,7 +243,7 @@ def main():
         for ex in examples:
             if st.button(ex):
                 st.session_state.user_query = ex
-                st.experimental_rerun()
+                st.rerun()  # Use st.rerun() instead of st.experimental_rerun()
 
     # Main interaction
     query = st.text_input(
