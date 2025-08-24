@@ -1,8 +1,16 @@
 import streamlit as st
+import sys
 import os
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
+# SQLite compatibility shim for Streamlit Cloud (use pysqlite3 if available)
+try:
+    import pysqlite3 as _sqlite3  # type: ignore
+    sys.modules["sqlite3"] = _sqlite3
+    sys.modules["_sqlite3"] = _sqlite3
+except Exception:
+    pass
 try:
     from langchain_chroma import Chroma as ChromaStore
     CHROMA_DEPRECATED = False
@@ -22,36 +30,48 @@ st.set_page_config(
     layout="wide"
 )
 
-# Try to load environment variables from multiple locations
-possible_env_paths = [
-    os.path.join(os.path.dirname(__file__), '.env'),  # Local directory
-    os.path.expanduser('~/.env'),  # Home directory
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'),  # Parent directory
-    '.env'  # Current working directory
-]
+"""
+Local .env loading (disabled by default for Streamlit Cloud).
+Uncomment this block for local development to auto-load a .env file.
 
-env_loaded = False
+possible_env_paths = [
+    os.path.join(os.path.dirname(__file__), '.env'),
+    os.path.expanduser('~/.env'),
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'),
+    '.env'
+]
 for env_path in possible_env_paths:
     if os.path.exists(env_path):
         load_dotenv(env_path)
-        env_loaded = True
-        st.success(f"Found .env file at: {env_path}")
+        st.info(f"Loaded .env from: {env_path}")
         break
-
-if not env_loaded:
-    st.error("Could not find .env file in any of the expected locations. Please ensure it exists and contains GEMINI_API_KEY.")
+"""
 
 # Constants
 PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_store")
 COLLECTION = "alice"
 
+def get_api_key_from_secrets() -> str:
+    return st.secrets.get("GEMINI_API_KEY", "")
+
+
+def get_api_key_from_env() -> str:
+    # Ensure you've loaded your .env (see commented block above) before using this.
+    return os.getenv("GEMINI_API_KEY", "")
+
+
 def check_api_key():
-    """Check if API key is properly set"""
-    api_key = os.getenv("GEMINI_API_KEY")
+    """Check if API key is properly set (prefer Streamlit Secrets by default)."""
+    # Default: use Streamlit Secrets
+    api_key = get_api_key_from_secrets()
+
+    # Local development option: comment the above and uncomment the next line
+    # api_key = get_api_key_from_env()
+
     if not api_key:
-        st.error("⚠️ GEMINI_API_KEY not found in environment!")
-        st.info("Please ensure your .env file contains: GEMINI_API_KEY=your_key_here")
+        st.error("⚠️ GEMINI_API_KEY not found. Add it in Settings → Secrets (Cloud) or .env (local).")
         return False
+    os.environ["GEMINI_API_KEY"] = api_key
     os.environ["GOOGLE_API_KEY"] = api_key
     return True
 

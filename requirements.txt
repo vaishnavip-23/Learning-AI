@@ -15,4 +15,4 @@ sentence-transformers
 huggingface_hub
 langchain-chroma
 pysqlite3-binary
-langchain-chroma
+
