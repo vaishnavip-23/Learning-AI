@@ -13,3 +13,4 @@ langchain-huggingface
 FlagEmbedding
 sentence-transformers
 huggingface_hub
+langchain-chroma
