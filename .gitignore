@@ -35,7 +35,6 @@ wheels/
 env/
 venv/
 ENV/
-
 # Keep devcontainer config
 .devcontainer/
 !.devcontainer/devcontainer.json
