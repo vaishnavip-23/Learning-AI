@@ -5,7 +5,7 @@ import json
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 
 # SQLite compatibility shim for Streamlit Cloud (use pysqlite3 if available)
@@ -31,7 +31,8 @@ except Exception:
 class Expansions(BaseModel):
     items: List[str] = Field(..., min_items=1, description="List of paraphrased questions")
     
-    @Field.validator('items')
+    @field_validator('items')
+    @classmethod
     def validate_items(cls, v):
         if not all(isinstance(item, str) and len(item.strip()) > 0 for item in v):
             raise ValueError("All items must be non-empty strings")
@@ -74,7 +75,6 @@ class Citation(BaseModel):
 class GeminiResponse(BaseModel):
     answer: str = Field(..., description="The answer from Gemini")
     citations: List[Citation] = Field(default_factory=list, description="Citations from the context")
-    context_headers: List[str] = Field(default_factory=list, description="Headers from the context")
 
 # Setup page config
 st.set_page_config(
@@ -132,11 +132,20 @@ def load_vectordb():
 def expand_queries(llm: ChatGoogleGenerativeAI, question: str, n: int = 4) -> List[str]:
     """Generate query expansions using Gemini with structured output."""
     prompt = f"""
-    Generate {n} different phrasings of the following question.
+    You are helping to search Alice in Wonderland by generating variations of a question.
+    Generate {n} different ways to ask this question that will help find relevant passages.
+    Include variations with character names (e.g., "Mad Hatter" and "Hatter") and different phrasings.
+    
     Return ONLY a valid JSON object with this exact format:
     {{"items": ["paraphrase1", "paraphrase2", ...]}}
 
     Question: "{question}"
+
+    Tips:
+    - Include character name variations
+    - Try different event descriptions
+    - Consider scene-specific words
+    - Mix specific and general phrasings
 
     Remember: Return ONLY the JSON object, no other text.
     """
@@ -161,14 +170,20 @@ def expand_queries(llm: ChatGoogleGenerativeAI, question: str, n: int = 4) -> Li
         return [question] * n
 
 def retrieve_candidates(vectordb, queries, per_query_k: int = 5) -> RetrievalResults:
-    """Retrieve candidates with structured output."""
+    """Retrieve candidates with structured output. Always returns exactly per_query_k chunks per query."""
     results = []
     seen = set()
+    
+    # Ensure we have exactly 4 queries
+    queries = queries[:4] if len(queries) > 4 else queries + [queries[0]] * (4 - len(queries))
+    
     for q in queries:
-        hits = vectordb.similarity_search_with_score(q, k=per_query_k)
+        query_results = []
+        hits = vectordb.similarity_search_with_score(q, k=per_query_k * 2)  # Get extra to handle duplicates
+        
         for doc, score in hits:
             key = (doc.metadata.get('start_index'), doc.metadata.get('chunk_number'))
-            if key not in seen:
+            if key not in seen and len(query_results) < per_query_k:
                 seen.add(key)
                 chunk = RetrievedChunk(
                     question=q,
@@ -176,7 +191,22 @@ def retrieve_candidates(vectordb, queries, per_query_k: int = 5) -> RetrievalRes
                     content=doc.page_content,
                     metadata=RetrievedMetadata(**doc.metadata)
                 )
-                results.append(chunk)
+                query_results.append(chunk)
+        
+        # If we still don't have enough unique results, relax the uniqueness constraint
+        if len(query_results) < per_query_k:
+            for doc, score in hits:
+                if len(query_results) < per_query_k:
+                    chunk = RetrievedChunk(
+                        question=q,
+                        score=float(score),
+                        content=doc.page_content,
+                        metadata=RetrievedMetadata(**doc.metadata)
+                    )
+                    query_results.append(chunk)
+        
+        results.extend(query_results[:per_query_k])  # Ensure exactly per_query_k results per query
+    
     return RetrievalResults(results=results)
 
 def rerank_candidates(question: str, candidates: RetrievalResults, top_n: int = 5) -> RerankedResults:
@@ -215,16 +245,15 @@ def rerank_candidates(question: str, candidates: RetrievalResults, top_n: int = 
     
     return RerankedResults(results=top_docs, original_question=question)
 
-def build_context(docs: RerankedResults) -> tuple[str, List[Citation], List[str]]:
+def build_context(docs: RerankedResults) -> tuple[str, List[Citation]]:
     """Build context with structured output."""
     parts = []
-    headers = []
     citations = []
     
     for doc in docs.results:
         m = doc.metadata
-        header = f"[Source: {m.source} | Chapter {m.chapter_number} {m.chapter_title} | Position={m.position} | Chunk {m.chunk_number}]"
-        headers.append(header)
+        # Add minimal header for context building
+        header = f"[Chapter {m.chapter_number} {m.chapter_title} | Position={m.position}]"
         parts.append(header + "\n" + doc.content)
         
         citations.append(Citation(
@@ -235,7 +264,7 @@ def build_context(docs: RerankedResults) -> tuple[str, List[Citation], List[str]
             chunk_number=m.chunk_number
         ))
     
-    return "\n\n".join(parts), citations, headers
+    return "\n\n".join(parts), citations
 
 def get_answer(
     vectordb,
@@ -246,14 +275,33 @@ def get_answer(
 ) -> GeminiResponse:
     """Get answer with structured output."""
     try:
+        # Initialize Gemini with more robust settings
         llm_gemini = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
             temperature=0.3,
+            top_p=0.95,  # Increased for more diverse responses
+            top_k=40,    # Increased for more options
+            max_output_tokens=1024  # Increased for longer responses
         )
+
+        # 1. Query Expansion
+        st.write("🔄 Generating query variations...")
         expansions = expand_queries(llm_gemini, query, n=4)
         queries = [query] + expansions
+        st.write(f"Generated {len(expansions)} variations")
 
+        # 2. Initial Retrieval
+        st.write("🔍 Searching knowledge base...")
         candidates = retrieve_candidates(vectordb, queries, per_query_k=per_query_k)
+        if not candidates.results:
+            return GeminiResponse(
+                answer="I couldn't find any relevant information in the book about that. Could you try rephrasing your question?",
+                citations=[]
+            )
+        st.write(f"Found {len(candidates.results)} initial matches")
+
+        # 3. Reranking
+        st.write("📊 Reranking results...")
         if use_reranker and candidates.results:
             top_docs = rerank_candidates(query, candidates, top_n=min(final_top_n, len(candidates.results)))
         else:
@@ -270,44 +318,65 @@ def get_answer(
 
         if not top_docs.results:
             return GeminiResponse(
-                answer="No relevant information found.",
-                citations=[],
-                context_headers=[]
+                answer="I found some matches but couldn't rank them properly. Could you try being more specific?",
+                citations=[]
             )
+        st.write(f"Selected top {len(top_docs.results)} relevant passages")
 
-        context, citations, headers = build_context(top_docs)
+        # 4. Context Building
+        context, citations = build_context(top_docs)
+        
+        # Enhanced prompt for better answers
         prompt = PromptTemplate.from_template(
             """
-            You are a helpful assistant. 
-            Answer the user question using ONLY the provided context.
-            Read the chunk summary carefully and if it matches with the question then check the chunk content and answer the question.
-            Expand the answer into at least 2–3 sentences and under 60 words and don't use quotes from the content unless the question is asking for the quotes. Always finish the answer and don't leave it in the middle.
-
+            You are a helpful assistant answering questions about Alice in Wonderland.
+            Use ONLY the provided context to answer the question.
+            
+            Guidelines:
+            1. If the context contains the information, provide a clear and complete answer
+            2. If the context doesn't contain enough information, say so
+            3. Focus on accuracy and completeness
+            4. Use 2-3 sentences minimum
+            5. Stay under 100 words unless more detail is needed
+            6. Only use quotes if specifically asked
+            7. Always provide a full, finished answer
+            
             Question: {question}
+            
             Context:
             {context}
+            
+            Remember: Base your answer ONLY on the provided context, not general knowledge.
             """
         )
 
+        # 5. Final Answer Generation
+        st.write("💭 Generating answer...")
         chat = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
-            temperature=0.2,
+            temperature=0.2,  # Lower temperature for more focused answers
             top_p=0.85,
             top_k=30,
-            max_output_tokens=512
+            max_output_tokens=1024  # Increased for longer responses
         )
         response = chat.invoke(prompt.format(question=query, context=context))
         
+        # Validate response
+        if not response.content or len(response.content.strip()) < 10:
+            return GeminiResponse(
+                answer="I found relevant information but had trouble generating a good answer. Please try asking again, perhaps with different wording.",
+                citations=citations
+            )
+        
         return GeminiResponse(
             answer=response.content,
-            citations=citations,
-            context_headers=headers
+            citations=citations
         )
     except Exception as e:
+        st.error(f"Error: {str(e)}")
         return GeminiResponse(
-            answer=f"Error generating answer: {str(e)}",
-            citations=[],
-            context_headers=[]
+            answer="I encountered an error while processing your question. Please try asking again with different wording.",
+            citations=[]
         )
 
 def main():
@@ -352,7 +421,7 @@ def main():
         for ex in examples:
             if st.button(ex):
                 st.session_state.user_query = ex
-                st.rerun()  # Use st.rerun() instead of st.experimental_rerun()
+                st.experimental_rerun()  # For compatibility with older Streamlit versions
 
     # Main interaction
     query = st.text_input(
@@ -375,11 +444,10 @@ def main():
         st.write(response.answer)
 
         if show_sources and response.citations:
-            with st.expander("Citations"):
-                for citation, header in zip(response.citations, response.context_headers):
-                    st.markdown(f"- **Chapter**: {citation.chapter_number} - {citation.chapter_title}")
-                    st.markdown(f"  **Source**: {citation.source} | **Position**: {citation.position} | **Chunk**: {citation.chunk_number}")
-                    st.markdown(f"  **Header**: {header}")
+            with st.expander("📚 Source Passages"):
+                for citation in response.citations:
+                    st.markdown(f"**Chapter {citation.chapter_number} - {citation.chapter_title}**")
+                    st.markdown(f"*Position {citation.position}, Chunk {citation.chunk_number}*")
 
 if __name__ == "__main__":
     main()
