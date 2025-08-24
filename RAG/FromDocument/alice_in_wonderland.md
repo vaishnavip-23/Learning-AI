@@ -1,31 +1,5 @@
-The Project Gutenberg eBook of Alice's Adventures in Wonderland
-
-This ebook is for the use of anyone anywhere in the United States and
-most other parts of the world at no cost and with almost no restrictions
-whatsoever. You may copy it, give it away or re-use it under the terms
-of the Project Gutenberg License included with this ebook or online
-at www.gutenberg.org. If you are not located in the United States,
-you will have to check the laws of the country where you are located
-before using this eBook.
-
-Title: Alice's Adventures in Wonderland
-
-Author: Lewis Carroll
-
-Release date: June 27, 2008 [eBook #11]
-Most recently updated: March 30, 2021
-
-Language: English
-
-Credits: Arthur DiBianca and David Widger
 
 **_ START OF THE PROJECT GUTENBERG EBOOK ALICE'S ADVENTURES IN WONDERLAND _**
-
-Alice’s Adventures in Wonderland
-
-by Lewis Carroll
-
-THE MILLENNIUM FULCRUM EDITION 3.0
 
 Contents
 
@@ -592,13 +566,13 @@ at the Mouse’s tail; “but why do you call it sad?” And she kept on
 puzzling about it while the Mouse was speaking, so that her idea of the
 tale was something like this:—
 
-         “Fury said to a mouse, That he met in the house, ‘Let us both
-         go to law: _I_ will prosecute _you_.—Come, I’ll take no
-         denial; We must have a trial: For really this morning I’ve
-         nothing to do.’ Said the mouse to the cur, ‘Such a trial, dear
-         sir, With no jury or judge, would be wasting our breath.’
-         ‘I’ll be judge, I’ll be jury,’ Said cunning old Fury: ‘I’ll
-         try the whole cause, and condemn you to death.’”
+ “Fury said to a mouse, That he met in the house, ‘Let us both
+go to law: _I_ will prosecute _you_.—Come, I’ll take no
+denial; We must have a trial: For really this morning I’ve
+nothing to do.’ Said the mouse to the cur, ‘Such a trial, dear
+sir, With no jury or judge, would be wasting our breath.’
+‘I’ll be judge, I’ll be jury,’ Said cunning old Fury: ‘I’ll
+try the whole cause, and condemn you to death.’”
 
 “You are not attending!” said the Mouse to Alice severely. “What are
 you thinking of?”
