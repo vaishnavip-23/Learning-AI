@@ -16,3 +16,5 @@ huggingface_hub
 langchain-chroma
 pysqlite3-binary
 langchain-chroma
+pydantic>=2.0.0
+instructor
