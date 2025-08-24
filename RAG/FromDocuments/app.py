@@ -1,9 +1,13 @@
 import streamlit as st
 import sys
 import os
+import json
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
 # SQLite compatibility shim for Streamlit Cloud (use pysqlite3 if available)
 try:
     import pysqlite3 as _sqlite3  # type: ignore
@@ -23,27 +27,61 @@ try:
 except Exception:
     FlagReranker = None
 
+# Pydantic models for structured output
+class Expansions(BaseModel):
+    items: List[str] = Field(..., min_items=1, description="List of paraphrased questions")
+    
+    @Field.validator('items')
+    def validate_items(cls, v):
+        if not all(isinstance(item, str) and len(item.strip()) > 0 for item in v):
+            raise ValueError("All items must be non-empty strings")
+        return [item.strip() for item in v]
+
+class RetrievedMetadata(BaseModel):
+    source: str
+    chapter_number: Optional[str] = None
+    chapter_title: Optional[str] = None
+    position: Optional[int] = Field(None, alias="start_index")
+    chunk_number: Optional[int] = None
+    chunk_summary: Optional[str] = None
+
+class RetrievedChunk(BaseModel):
+    question: str
+    score: float
+    content: str
+    metadata: RetrievedMetadata
+
+class RetrievalResults(BaseModel):
+    results: List[RetrievedChunk]
+
+class RerankedDocument(BaseModel):
+    content: str
+    metadata: RetrievedMetadata
+    rerank_score: float
+    
+class RerankedResults(BaseModel):
+    results: List[RerankedDocument]
+    original_question: str
+    model_name: str = "BAAI/bge-reranker-base"
+
+class Citation(BaseModel):
+    source: str
+    chapter_number: Optional[str] = None
+    chapter_title: Optional[str] = None
+    position: Optional[int] = Field(None, alias="start_index")
+    chunk_number: Optional[int] = None
+
+class GeminiResponse(BaseModel):
+    answer: str = Field(..., description="The answer from Gemini")
+    citations: List[Citation] = Field(default_factory=list, description="Citations from the context")
+    context_headers: List[str] = Field(default_factory=list, description="Headers from the context")
+
 # Setup page config
 st.set_page_config(
     page_title="Alice in Wonderland Q&A",
     page_icon="🎩",
     layout="wide"
 )
-
-# Local .env loading (disabled by default for Streamlit Cloud).
-# Uncomment this block for local development to auto-load a .env file.
-#
-# possible_env_paths = [
-#     os.path.join(os.path.dirname(__file__), '.env'),
-#     os.path.expanduser('~/.env'),
-#     os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'),
-#     '.env'
-# ]
-# for env_path in possible_env_paths:
-#     if os.path.exists(env_path):
-#         load_dotenv(env_path)
-#         st.info(f"Loaded .env from: {env_path}")
-#         break
 
 # Constants
 PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_store")
@@ -52,11 +90,8 @@ COLLECTION = "alice"
 def get_api_key_from_secrets() -> str:
     return st.secrets.get("GEMINI_API_KEY", "")
 
-
 def get_api_key_from_env() -> str:
-    # Ensure you've loaded your .env (see commented block above) before using this.
     return os.getenv("GEMINI_API_KEY", "")
-
 
 def check_api_key():
     """Check if API key is properly set (prefer Streamlit Secrets by default)."""
@@ -94,17 +129,39 @@ def load_vectordb():
         st.error(f"Error loading Chroma DB: {str(e)}")
         return None
 
-def expand_queries(llm: ChatGoogleGenerativeAI, question: str, n: int = 4):
+def expand_queries(llm: ChatGoogleGenerativeAI, question: str, n: int = 4) -> List[str]:
+    """Generate query expansions using Gemini with structured output."""
     prompt = f"""
-    Generate {n} different phrasings of the following user question:
-    "{question}"
-    Provide only the variations, one per line.
-    """
-    out = llm.invoke(prompt)
-    expansions = list(set(out.content.strip().split("\n")))
-    return [q.strip("- ").strip() for q in expansions if q.strip()]
+    Generate {n} different phrasings of the following question.
+    Return ONLY a valid JSON object with this exact format:
+    {{"items": ["paraphrase1", "paraphrase2", ...]}}
 
-def retrieve_candidates(vectordb, queries, per_query_k: int = 5):
+    Question: "{question}"
+
+    Remember: Return ONLY the JSON object, no other text.
+    """
+    response = llm.invoke(prompt)
+    try:
+        # Try to parse the response as JSON
+        json_str = response.content.strip()
+        # Find JSON object if it's embedded in other text
+        start = json_str.find('{')
+        end = json_str.rfind('}') + 1
+        if start >= 0 and end > start:
+            json_str = json_str[start:end]
+        result = json.loads(json_str)
+        
+        # Validate with Pydantic
+        expansions = Expansions(items=result.get('items', []))
+        # Ensure we have exactly n items
+        items = expansions.items[:n] if len(expansions.items) > n else expansions.items + [question] * (n - len(expansions.items))
+        return items
+    except Exception:
+        # Fallback: return original question repeated
+        return [question] * n
+
+def retrieve_candidates(vectordb, queries, per_query_k: int = 5) -> RetrievalResults:
+    """Retrieve candidates with structured output."""
     results = []
     seen = set()
     for q in queries:
@@ -113,39 +170,72 @@ def retrieve_candidates(vectordb, queries, per_query_k: int = 5):
             key = (doc.metadata.get('start_index'), doc.metadata.get('chunk_number'))
             if key not in seen:
                 seen.add(key)
-                results.append((doc, score, q))
-    return results
+                chunk = RetrievedChunk(
+                    question=q,
+                    score=float(score),
+                    content=doc.page_content,
+                    metadata=RetrievedMetadata(**doc.metadata)
+                )
+                results.append(chunk)
+    return RetrievalResults(results=results)
 
-def rerank_candidates(question: str, candidates, top_n: int = 5):
+def rerank_candidates(question: str, candidates: RetrievalResults, top_n: int = 5) -> RerankedResults:
+    """Rerank candidates with structured output."""
     if FlagReranker is None:
         # Fallback: use ANN scores (ascending cosine distance)
-        sorted_candidates = sorted(candidates, key=lambda x: x[1])
-        return [(doc, score) for (doc, score, _q) in sorted_candidates[:top_n]]
+        sorted_candidates = sorted(candidates.results, key=lambda x: x.score)
+        reranked_docs = [
+            RerankedDocument(
+                content=doc.content,
+                metadata=doc.metadata,
+                rerank_score=float(doc.score)
+            ) for doc in sorted_candidates[:top_n]
+        ]
+        return RerankedResults(results=reranked_docs, original_question=question)
+
     reranker = FlagReranker("BAAI/bge-reranker-base", use_fp16=False)
-    pairs = [[question, doc.page_content] for doc, _, _ in candidates]
+    pairs = [[question, doc.content] for doc in candidates.results]
     scores = reranker.compute_score(pairs)
-    reranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+    reranked = sorted(zip(candidates.results, scores), key=lambda x: x[1], reverse=True)
+    
     seen = set()
     top_docs = []
-    for (doc, _score, _q), rerank_score in reranked:
-        start_index = doc.metadata.get('start_index')
-        if start_index not in seen:
-            seen.add(start_index)
-            top_docs.append((doc, rerank_score))
+    for doc, rerank_score in reranked:
+        sid = doc.metadata.position
+        if sid not in seen:
+            seen.add(sid)
+            reranked_doc = RerankedDocument(
+                content=doc.content,
+                metadata=doc.metadata,
+                rerank_score=float(rerank_score)
+            )
+            top_docs.append(reranked_doc)
         if len(top_docs) == top_n:
             break
-    return top_docs
+    
+    return RerankedResults(results=top_docs, original_question=question)
 
-def build_context(doc_with_scores):
+def build_context(docs: RerankedResults) -> tuple[str, List[Citation], List[str]]:
+    """Build context with structured output."""
     parts = []
-    for d, _ in doc_with_scores:
-        m = getattr(d, 'metadata', {}) or {}
-        start_index = m.get('start_index', '?')
-        chunk_number = m.get('chunk_number', '?')
-        source = m.get('source', 'unknown')
-        header = f"[Source: {source} | Position={start_index} | Chunk {chunk_number}]"
-        parts.append(header + "\n" + d.page_content)
-    return "\n\n".join(parts)
+    headers = []
+    citations = []
+    
+    for doc in docs.results:
+        m = doc.metadata
+        header = f"[Source: {m.source} | Chapter {m.chapter_number} {m.chapter_title} | Position={m.position} | Chunk {m.chunk_number}]"
+        headers.append(header)
+        parts.append(header + "\n" + doc.content)
+        
+        citations.append(Citation(
+            source=m.source,
+            chapter_number=m.chapter_number,
+            chapter_title=m.chapter_title,
+            start_index=m.position,
+            chunk_number=m.chunk_number
+        ))
+    
+    return "\n\n".join(parts), citations, headers
 
 def get_answer(
     vectordb,
@@ -153,7 +243,8 @@ def get_answer(
     use_reranker: bool = True,
     per_query_k: int = 5,
     final_top_n: int = 8,  # Fixed at 8 chunks
-):
+) -> GeminiResponse:
+    """Get answer with structured output."""
     try:
         llm_gemini = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
@@ -163,27 +254,39 @@ def get_answer(
         queries = [query] + expansions
 
         candidates = retrieve_candidates(vectordb, queries, per_query_k=per_query_k)
-        if use_reranker and candidates:
-            top_docs = rerank_candidates(query, candidates, top_n=min(final_top_n, len(candidates)))
+        if use_reranker and candidates.results:
+            top_docs = rerank_candidates(query, candidates, top_n=min(final_top_n, len(candidates.results)))
         else:
-            sorted_candidates = sorted(candidates, key=lambda x: x[1])
-            top_docs = [(doc, score) for (doc, score, _q) in sorted_candidates[:final_top_n]]
+            # Fallback to ANN scores
+            sorted_candidates = sorted(candidates.results, key=lambda x: x.score)
+            reranked_docs = [
+                RerankedDocument(
+                    content=doc.content,
+                    metadata=doc.metadata,
+                    rerank_score=float(doc.score)
+                ) for doc in sorted_candidates[:final_top_n]
+            ]
+            top_docs = RerankedResults(results=reranked_docs, original_question=query)
 
-        if not top_docs:
-            return "No relevant information found.", []
+        if not top_docs.results:
+            return GeminiResponse(
+                answer="No relevant information found.",
+                citations=[],
+                context_headers=[]
+            )
 
-        context = build_context(top_docs)
+        context, citations, headers = build_context(top_docs)
         prompt = PromptTemplate.from_template(
             """
-You are a helpful assistant. 
-Answer the user question using ONLY the provided context.
-Read the chunk summary carefully and if it matches with the question then check the chunk content and answer the question.
-Expand the answer into at least 2–3 sentences and under 60 words and don't use quotes from the content unless the question is asking for the quotes. Always finish the answer and don't leave it in the middle.
+            You are a helpful assistant. 
+            Answer the user question using ONLY the provided context.
+            Read the chunk summary carefully and if it matches with the question then check the chunk content and answer the question.
+            Expand the answer into at least 2–3 sentences and under 60 words and don't use quotes from the content unless the question is asking for the quotes. Always finish the answer and don't leave it in the middle.
 
-Question: {question}
-Context:
-{context}
-"""
+            Question: {question}
+            Context:
+            {context}
+            """
         )
 
         chat = ChatGoogleGenerativeAI(
@@ -194,9 +297,18 @@ Context:
             max_output_tokens=512
         )
         response = chat.invoke(prompt.format(question=query, context=context))
-        return response.content, top_docs
+        
+        return GeminiResponse(
+            answer=response.content,
+            citations=citations,
+            context_headers=headers
+        )
     except Exception as e:
-        return f"Error generating answer: {str(e)}", []
+        return GeminiResponse(
+            answer=f"Error generating answer: {str(e)}",
+            citations=[],
+            context_headers=[]
+        )
 
 def main():
     st.title("🎩 Alice in Wonderland Q&A")
@@ -251,7 +363,7 @@ def main():
 
     if query:
         with st.spinner("Thinking..."):
-            answer, sources = get_answer(
+            response = get_answer(
                 vectordb,
                 query,
                 use_reranker=True,  # Always use reranker
@@ -260,18 +372,14 @@ def main():
         st.markdown("### Question")
         st.write(query)
         st.markdown("### Answer")
-        st.write(answer)
+        st.write(response.answer)
 
-        if show_sources and sources:
+        if show_sources and response.citations:
             with st.expander("Citations"):
-                for d, score in sources:
-                    m = d.metadata or {}
-                    chunk_no = m.get('chunk_number', '?')
-                    source = m.get('source', 'unknown')
-                    summary = (m.get('chunk_summary') or '').strip()
-                    if len(summary) > 160:
-                        summary = summary[:160].rstrip() + "..."
-                    st.markdown(f"- **Source**: {source} | **Chunk**: {chunk_no} | **Summary**: {summary}")
+                for citation, header in zip(response.citations, response.context_headers):
+                    st.markdown(f"- **Chapter**: {citation.chapter_number} - {citation.chapter_title}")
+                    st.markdown(f"  **Source**: {citation.source} | **Position**: {citation.position} | **Chunk**: {citation.chunk_number}")
+                    st.markdown(f"  **Header**: {header}")
 
 if __name__ == "__main__":
     main()
