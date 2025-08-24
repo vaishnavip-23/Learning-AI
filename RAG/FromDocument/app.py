@@ -3,7 +3,12 @@ import os
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
-from langchain_community.vectorstores import Chroma
+try:
+    from langchain_chroma import Chroma as ChromaStore
+    CHROMA_DEPRECATED = False
+except Exception:
+    from langchain_community.vectorstores import Chroma as ChromaStore
+    CHROMA_DEPRECATED = True
 from langchain_huggingface import HuggingFaceEmbeddings
 try:
     from FlagEmbedding import FlagReranker
@@ -59,11 +64,13 @@ def load_vectordb():
             st.error("Chroma store not found. Run the notebook to build 'chroma_store/'.")
             return None
         embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
-        vectordb = Chroma(
+        vectordb = ChromaStore(
             embedding_function=embeddings,
             persist_directory=PERSIST_DIR,
             collection_name=COLLECTION,
         )
+        if CHROMA_DEPRECATED:
+            st.warning("Using deprecated Chroma import from langchain_community. Consider installing 'langchain-chroma' and switching to the new import.")
         return vectordb
     except Exception as e:
         st.error(f"Error loading Chroma DB: {str(e)}")
@@ -79,7 +86,7 @@ def expand_queries(llm: ChatGoogleGenerativeAI, question: str, n: int = 4):
     expansions = list(set(out.content.strip().split("\n")))
     return [q.strip("- ").strip() for q in expansions if q.strip()]
 
-def retrieve_candidates(vectordb: Chroma, queries, per_query_k: int = 5):
+def retrieve_candidates(vectordb, queries, per_query_k: int = 5):
     results = []
     seen = set()
     for q in queries:
@@ -96,7 +103,7 @@ def rerank_candidates(question: str, candidates, top_n: int = 5):
         # Fallback: use ANN scores (ascending cosine distance)
         sorted_candidates = sorted(candidates, key=lambda x: x[1])
         return [(doc, score) for (doc, score, _q) in sorted_candidates[:top_n]]
-    reranker = FlagReranker("BAAI/bge-reranker-base", use_fp16=True)
+    reranker = FlagReranker("BAAI/bge-reranker-base", use_fp16=False)
     pairs = [[question, doc.page_content] for doc, _, _ in candidates]
     scores = reranker.compute_score(pairs)
     reranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
@@ -115,16 +122,15 @@ def build_context(doc_with_scores):
     parts = []
     for d, _ in doc_with_scores:
         m = getattr(d, 'metadata', {}) or {}
-        chapter_number = m.get('chapter_number', 'Unknown')
-        chapter_title = m.get('chapter_title', 'Unknown')
         start_index = m.get('start_index', '?')
         chunk_number = m.get('chunk_number', '?')
-        header = f"[Chapter {chapter_number} {chapter_title} | Position={start_index} | Chunk {chunk_number}]"
+        source = m.get('source', 'unknown')
+        header = f"[Source: {source} | Position={start_index} | Chunk {chunk_number}]"
         parts.append(header + "\n" + d.page_content)
     return "\n\n".join(parts)
 
 def get_answer(
-    vectordb: Chroma,
+    vectordb,
     query: str,
     use_reranker: bool = True,
     per_query_k: int = 5,
@@ -154,7 +160,7 @@ def get_answer(
 You are a helpful assistant. 
 Answer the user question using ONLY the provided context.
 Read the chunk summary carefully and if it matches with the question then check the chunk content and answer the question.
-Expand the answer into at least 2–3 sentences and don't use quotes from the content unless the question is asking for the quotes.
+Expand the answer into at least 2–3 sentences and under 60 words and don't use quotes from the content unless the question is asking for the quotes. Always finish the answer and don't leave it in the middle.
 
 Question: {question}
 Context:
@@ -209,11 +215,10 @@ def main():
 
         st.subheader("Try a sample")
         examples = [
-            "Why did Alice follow the White Rabbit and what happened immediately after?",
-            "What happens at the tea party?",
+            "Why did Alice follow the White Rabbit?",
+            "What happens at the tea party with the Mad Hatter?",
             "How does Alice meet the Mad Hatter?",
-            "What does the Queen of Hearts say?",
-            "Describe the Cheshire Cat's appearance",
+            "Describe the Cheshire Cat's appearance under 50 words?",
         ]
         if "user_query" not in st.session_state:
             st.session_state.user_query = ""
@@ -237,20 +242,21 @@ def main():
                 use_reranker=use_reranker,
                 final_top_n=final_top_n,
             )
+        st.markdown("### Question")
+        st.write(query)
         st.markdown("### Answer")
         st.write(answer)
 
         if show_sources and sources:
-            with st.expander("View retrieved sources"):
+            with st.expander("Citations"):
                 for d, score in sources:
                     m = d.metadata or {}
-                    chapter_number = m.get('chapter_number', 'Unknown')
-                    chapter_title = m.get('chapter_title', 'Unknown')
-                    start_idx = m.get('start_index', '?')
                     chunk_no = m.get('chunk_number', '?')
-                    st.markdown(
-                        f"- **Chapter**: {chapter_number} {chapter_title} | **Pos**: {start_idx} | **Chunk**: {chunk_no} | **Score**: {score}"
-                    )
+                    source = m.get('source', 'unknown')
+                    summary = (m.get('chunk_summary') or '').strip()
+                    if len(summary) > 160:
+                        summary = summary[:160].rstrip() + "..."
+                    st.markdown(f"- **Source**: {source} | **Chunk**: {chunk_no} | **Summary**: {summary}")
 
 if __name__ == "__main__":
     main()
