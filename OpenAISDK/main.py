@@ -1,10 +1,19 @@
-from agents import Agent, Runner
+from agents import Agent, Runner,function_tool
 from dotenv import load_dotenv
 load_dotenv()
 
-agent = Agent(name="Assistant", instructions="You are a helpful assistant")
+@function_tool
+def get_weather(city: str) -> str:
+    """returns weather info for the specified city."""
+    return f"The weather in {city} is sunny"
 
-prompt="Write a haiku about recursion in programming."
+
+agent = Agent(name="Assistant", 
+             instructions="Always respond in haiku form",
+             model="gpt-5-mini",
+             tools=[get_weather])
+prompt="What is the weather in Tokyo?"
+
 
 result = Runner.run_sync(agent,prompt)
 print(result.final_output)
